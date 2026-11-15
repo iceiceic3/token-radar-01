@@ -1,4 +1,4 @@
-// Token Radar, model radar-2: one sealed snapshot in, one ranked board out.
+// Token Radar, model radar-3: one sealed snapshot in, one ranked board out.
 //
 // The board ranks every pre-token protocol the snapshot can rank, strongest implied
 // value first. A protocol is pre-token when its record carries no token at all (no
@@ -15,14 +15,20 @@
 //   categoryBenchmark  the median market-cap / TVL of the live-token protocols in
 //                      the same category (at least 3 comparables, else the global
 //                      median over all live protocols), clamped to [0.03, 1.0].
-//                      A lending protocol is priced like lending protocols trade,
-//                      a DEX like DEXes trade. The benchmark is computed from the
+//                      Ratios outside [0.01, 3] are dropped before the median:
+//                      a token with a tiny TVL and a hyped market cap must not
+//                      set the benchmark for its whole category. A lending
+//                      protocol is priced like lending protocols trade, a DEX
+//                      like DEXes trade. The benchmark is computed from the
 //                      snapshot at run time, so it moves with the data, not with
 //                      anyone's opinion of a name.
-//   growthMult         1 + clamp(change_7d, -60, 120) / 100 x 0.6. A protocol
-//                      whose TVL is growing fast is worth more than one whose
-//                      TVL is shrinking; the clamp keeps one wild week from
-//                      deciding the board.
+//   growthMult         1 + eff(change_7d) / 100 x 0.6, where eff clamps the
+//                      change to [-60, 120] and then takes the square root of
+//                      positive growth: eff = 120 x sqrt(g / 120) for g >= 0,
+//                      eff = g for g < 0. One wild week still cannot decide the
+//                      board, and steady growth counts more than a single spike:
+//                      +10% a week compounds to far more than +10% a year.
+//                      Declines stay linear: shrinking TVL is real signal.
 //   maturityMult       0.6 + min(age_days, 1095) / 1095 x 0.4. Age is the time
 //                      since DefiLlama first listed the protocol: how long it has
 //                      run with no token. Unknown age counts as 365 days.
@@ -69,6 +75,8 @@ export interface ModelConstants {
   breadth_cap: number;
   benchmark_floor: number;
   benchmark_cap: number;
+  benchmark_ratio_floor: number;
+  benchmark_ratio_cap: number;
   min_comparables: number;
 }
 
@@ -84,11 +92,13 @@ export const MODEL: ModelConstants = {
   breadth_cap: 1.15,
   benchmark_floor: 0.03,
   benchmark_cap: 1.0,
+  benchmark_ratio_floor: 0.01,
+  benchmark_ratio_cap: 3,
   min_comparables: 3,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -255,9 +265,10 @@ export function isRankable(p: SnapshotProtocol): boolean {
 
 /**
  * The category benchmarks, computed from the snapshot's own live protocols: for
- * each category, the median market-cap / TVL of its live protocols. Categories
- * with too few comparables fall back to the global median. Every benchmark is
- * clamped so one thin category cannot set an absurd multiple.
+ * each category, the median market-cap / TVL of its live protocols, after
+ * dropping ratios outside [0.01, 3]. Categories with too few comparables fall
+ * back to the global median. Every benchmark is clamped so one thin category
+ * cannot set an absurd multiple.
  */
 export function categoryBenchmarks(
   snapshot: Snapshot,
@@ -270,6 +281,7 @@ export function categoryBenchmarks(
     if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    if (ratio < model.benchmark_ratio_floor || ratio > model.benchmark_ratio_cap) continue;
     allRatios.push(ratio);
     const key = p.category ?? 'Other';
     const list = ratiosByCategory.get(key);
@@ -317,7 +329,8 @@ export function impliedValue(
   const { benchmark, comparables } = benchmarkFor(protocol, benchmarks);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const effGrowth = growthPct >= 0 ? model.growth_cap * Math.sqrt(growthPct / model.growth_cap) : growthPct;
+  const growthMult = 1 + (effGrowth / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult =
     model.maturity_floor +
@@ -456,6 +469,55 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 }
 
 /**
+ * The chain's leading venues, for the farm plan's concrete steps. Keyed by
+ * chain, which the snapshot records, never by protocol name: the plan says
+ * where the swap leg happens, and the venue follows the chain, not the row.
+ */
+const VENUES: Record<string, string> = {
+  Ethereum: 'Uniswap and Aave',
+  Solana: 'Jupiter and Kamino',
+  Arbitrum: 'GMX and Uniswap',
+  Base: 'Aerodrome',
+  BSC: 'PancakeSwap',
+  Optimism: 'Velodrome',
+  Polygon: 'QuickSwap',
+  Avalanche: 'Trader Joe',
+  Sui: 'Cetus',
+  Aptos: 'Thala',
+};
+
+/** Where to do the swap leg, from the protocol's own chain. */
+function venueFor(chain: string): string {
+  return VENUES[chain] ?? "the chain's leading DEX";
+}
+
+/** What one transaction costs on this chain, in dollars of gas. */
+function gasFor(chain: string): string {
+  if (chain === 'Ethereum') return 'about $8 of gas';
+  if (chain === 'Solana') return 'under $1 of gas';
+  if (['Arbitrum', 'Optimism', 'Base', 'Polygon', 'BSC', 'Avalanche', 'Sui', 'Aptos', 'zkSync Era', 'Linea', 'Scroll', 'Blast'].includes(chain)) return 'about $1 of gas';
+  return 'about $2 of gas';
+}
+
+/** The weekly qualifying action, in the protocol's own category words. */
+function weeklyVerb(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'supply, borrow or repay';
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return 'add or remove liquidity, or swap';
+  if (c.includes('bridge')) return 'bridge a small amount';
+  if (c.includes('staking') || c.includes('restak')) return 'stake or restake';
+  if (c.includes('perpetual') || c.includes('derivative')) return 'open or close a small position';
+  if (c.includes('prediction')) return 'place a market position';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('onchain capital')) return 'deposit into a vault';
+  if (c.includes('stable')) return 'mint, deposit or redeem';
+  if (c.includes('rwa')) return 'mint or hold the yield asset';
+  if (c.includes('insurance')) return 'hold or renew cover';
+  if (c.includes('basis')) return 'hold the basis position';
+  if (c.includes('privacy')) return 'use the private pool';
+  return 'deposit, swap or vote';
+}
+
+/**
  * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
  * The weekly step names the protocol's own qualifying actions, and the last step names the exit check.
@@ -465,21 +527,23 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
+  const gas = gasFor(chain);
+  const venue = venueFor(chain);
   const others = p.chains.length > 1 ? ` Repeat the position on ${p.chains[1]} if the protocol runs a points program there too.` : '';
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `${gas} for the first transaction`,
       time: '5 minutes',
     },
     {
       text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and ${gas}`,
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.${others}`,
-      cost: 'about $2 of gas a week',
+      text: `Make one qualifying action each week on ${p.name}: ${weeklyVerb(p)}. Do the swap leg on ${venue} on ${chain} when the action needs a swap.${others}`,
+      cost: `${gas} a week`,
       time: '10 minutes a week',
     },
     {
