@@ -46,7 +46,7 @@ button { cursor: pointer; }
 .fact small { color: var(--faint); font-size: 12px; }
 
 /* Picks */
-.picks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
+.picks { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
 .pick { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--gold); border-radius: var(--radius); padding: 12px 14px; text-align: left; }
 .pick:hover { border-color: var(--gold); }
 .pick .why { display: block; color: var(--gold); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 4px; }
